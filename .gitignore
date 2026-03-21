@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+app_backup.py
+node_modules/
+.venv/
+venv/
+env/
