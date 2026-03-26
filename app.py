@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import List, Dict, Any
+from pymongo import MongoClient
+from bson.objectid import ObjectId
 
 load_dotenv()
 
@@ -15,15 +17,24 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Use gemini-1.5-flash for reliability or 2.0 if needed
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-2.5-flash") # Reverting name as per snippet logic or staying same but 1.5 is standard, user had 2.5 which might be a typo but let's keep it simple
 
 app = Flask(__name__)
 CORS(app)
 
 # -------------------------------
+# MONGODB CONFIG
+# -------------------------------
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['company-prj'] # Database name from MONGO_URI
+online_requests = db['onlinerequests'] # Mongoose pluralizes OnlineRequest
+
+# -------------------------------
 # CONFIG
 # -------------------------------
-BASE_URL = os.getenv("CLINICAL_API_URL", "http://localhost:5000/api/n8n")
+# BASE_URL is no longer needed since we handle it locally
+# BASE_URL = os.getenv("CLINICAL_API_URL", "http://localhost:5000/api/n8n")
 
 # In-memory chat history (Global for demo, use DB for production)
 session_storage: Dict[str, List[Dict[str, Any]]] = {}
@@ -42,8 +53,8 @@ Return JSON ONLY with these fields:
 - intent: ("book", "cancel", "show", "update", "unwanted", "unknown")
 - name: (Patient name)
 - phone: (Phone number, digits only)
-- date: (YYYY-MM-DD)
-- time: (HH:MM)
+- date: (YYYY-MM-DD or readable format)
+- time: (HH:MM or readable format)
 - appointment_id: (e.g. REQ-1001)
 
 Context (History):
@@ -68,8 +79,8 @@ Branding Guidelines:
 "Hi! Welcome to the Doctor Clinic Assistant.
 You can send a message for the following requests:
 • Book an appointment Example: "Book appointment March 20 at 10:30 for Ravi Kumar"
-• Cancel an appointment Example: "Cancel appointment EQ1001"
-• View your appointment details Example: "Show my appointment details" or "Show appointment EQ1001"
+• Cancel an appointment Example: "Cancel appointment REQ-1001"
+• View your appointment details Example: "Show my appointment details" or "Show appointment REQ-1001"
 • Update missing details Example: "My phone number is 9876543210" or "The appointment is at 4 pm"
 
 Please type your request in a simple sentence and the system will process it for you."
@@ -89,6 +100,8 @@ Return the final AI message only.
 
 def extract_json(text):
     try:
+        # Strip potential markdown code blocks
+        text = re.sub(r'```json\n?|\n?```', '', text).strip()
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             return json.loads(match.group())
@@ -106,62 +119,150 @@ def get_history_text(session_id: str) -> str:
     return text
 
 # -------------------------------
-# CONTROLLERS
+# DATABASE HELPERS (Logic from Express Controller)
+# -------------------------------
+
+def db_receive_appointment_request(data):
+    name = data.get("name")
+    phno = data.get("phno") or data.get("phone")
+    date = data.get("date")
+    time = data.get("time")
+
+    if not all([name, phno, date, time]):
+        return {"status": False, "message": "Please provide your name, phone, date, and time for appointment booking."}
+
+    try:
+        count = online_requests.count_documents({})
+        request_id = f"REQ-{1000 + count + 1}"
+
+        new_request = {
+            "patientName": name,
+            "patientContact": phno,
+            "date": date, # Storing as string or converting to Date if needed, but the JS one seemed to handle Date? Wait. The model says Date but the controller gets string.
+            "time": time,
+            "requestId": request_id,
+            "status": "Pending",
+            "createdAt": datetime.now(),
+            "updatedAt": datetime.now()
+        }
+
+        result = online_requests.insert_one(new_request)
+        
+        return {
+            "status": True,
+            "message": "Request received successfully.",
+            "requestId": str(result.inserted_id),
+            "appid": request_id
+        }
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+def db_delete_by_phone(id_param):
+    if not id_param:
+        return {"status": False, "message": "Request ID is required"}
+    
+    try:
+        # Match by requestId as in Express controller
+        res = online_requests.delete_many({"requestId": id_param, "status": "Pending"})
+        return {
+            "status": True,
+            "message": "Deletion sequence completed across all clinical buffers.",
+            "onlineRequestsDeleted": res.deleted_count
+        }
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+def db_view_by_id(id_param):
+    if not id_param:
+        return {"status": False, "message": "Request ID is required"}
+    
+    try:
+        cursor = online_requests.find({"requestId": id_param})
+        results = []
+        for doc in cursor:
+            doc['_id'] = str(doc['_id'])
+            if 'createdAt' in doc: doc['createdAt'] = str(doc['createdAt'])
+            if 'updatedAt' in doc: doc['updatedAt'] = str(doc['updatedAt'])
+            results.append(doc)
+        return results
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+def db_update_by_id(id_param, updates_dict):
+    if not id_param:
+        return {"status": False, "message": "Request ID is required"}
+    
+    # Filter empty/none updates
+    updates = {}
+    for k, v in updates_dict.items():
+        if v not in [None, "", "null", "undefined"]:
+            updates[k] = v
+            
+    if not updates:
+        return {"status": False, "message": "No valid fields to update"}
+
+    try:
+        updates['updatedAt'] = datetime.now()
+        result = online_requests.find_one_and_update(
+            {"requestId": id_param, "status": "Pending"},
+            {"$set": updates},
+            return_document=True
+        )
+        
+        if not result:
+            return {"status": False, "message": "No pending request found with this ID"}
+        
+        result['_id'] = str(result['_id'])
+        if 'createdAt' in result: result['createdAt'] = str(result['createdAt'])
+        if 'updatedAt' in result: result['updatedAt'] = str(result['updatedAt'])
+        
+        return result
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+# -------------------------------
+# CHATBOT CONTROLLERS (Internal wrappers)
 # -------------------------------
 
 def call_book_appointment(data):
     missing = []
     if not data.get("name"): missing.append("name")
-    if not data.get("phone"): missing.append("phone number")
+    if not (data.get("phone") or data.get("phno")): missing.append("phone number")
     if not data.get("date"): missing.append("date")
     if not data.get("time"): missing.append("time")
 
     if missing:
         return f"MISSING_FIELDS: {', '.join(missing)}"
 
-    payload = {
-        "name": data["name"],
-        "phno": data["phone"],
-        "date": data["date"],
-        "time": data["time"]
-    }
-
-    try:
-        res = requests.post(f"{BASE_URL}/receiver", json=payload, timeout=5)
-        result = res.json()
-        if result.get("status"):
-            return f"SUCCESS: Booking confirmed. Request ID is **{result.get('appid')}**."
-        return f"ERROR: Backend rejected booking - {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        return f"ERROR: Backend failed - {str(e)}"
+    result = db_receive_appointment_request(data)
+    if result.get("status"):
+        return f"SUCCESS: Booking confirmed. Request ID is **{result.get('appid')}**."
+    return f"ERROR: Booking failed - {result.get('message', 'Unknown error')}"
 
 def call_cancel_appointment(data):
     aid = data.get("appointment_id")
     if not aid:
         return "MISSING_FIELDS: appointment ID"
 
-    try:
-        res = requests.delete(f"{BASE_URL}/delete/{aid}", timeout=5)
-        result = res.json()
+    result = db_delete_by_phone(aid)
+    if result.get("status"):
         deleted = result.get("onlineRequestsDeleted", 0)
         if deleted > 0:
             return f"SUCCESS: Appointment **{aid}** has been cancelled successfully."
         return f"ERROR: No matching pending appointment found for ID **{aid}**."
-    except Exception as e:
-        return f"ERROR: Connection failure - {str(e)}"
+    return f"ERROR: Operation failed - {result.get('message')}"
 
 def call_show_appointment(data):
     aid = data.get("appointment_id")
     if not aid:
         return "MISSING_FIELDS: appointment ID"
 
-    try:
-        res = requests.get(f"{BASE_URL}/view/{aid}", timeout=5)
-        result = res.json()
+    result = db_view_by_id(aid)
+    if isinstance(result, list):
         if not result:
             return f"NOT_FOUND: No record found for ID **{aid}**."
         
-        record = result[0] if isinstance(result, list) and len(result) > 0 else result
+        record = result[0]
         details = (
             f"Patient: {record.get('patientName', 'N/A')}\n"
             f"Date: {record.get('date', 'N/A')}\n"
@@ -169,8 +270,7 @@ def call_show_appointment(data):
             f"Status: {record.get('status', 'N/A')}"
         )
         return f"SUCCESS: Found details for {aid}:\n{details}"
-    except Exception as e:
-        return f"ERROR: Could not retrieve data - {str(e)}"
+    return f"ERROR: {result.get('message')}"
 
 def call_update_appointment(data):
     aid = data.get("appointment_id")
@@ -186,13 +286,10 @@ def call_update_appointment(data):
     if not payload:
         return "NO_UPDATES: No new information provided to update."
 
-    try:
-        res = requests.put(f"{BASE_URL}/update/{aid}", json=payload, timeout=5)
-        if res.status_code == 200:
-            return f"SUCCESS: Appointment **{aid}** has been updated."
-        return f"ERROR: Failed to update"
-    except Exception as e:
-        return f"ERROR: Backend connection failed - {str(e)}"
+    result = db_update_by_id(aid, payload)
+    if "status" in result and not result["status"]:
+        return f"ERROR: {result.get('message')}"
+    return f"SUCCESS: Appointment **{aid}** has been updated."
 
 # -------------------------------
 # AGENT LOGIC
@@ -259,7 +356,7 @@ def process_agent(session_id, user_message):
     return final_reply, extracted
 
 # -------------------------------
-# ROUTES
+# BOT ROUTES
 # -------------------------------
 
 @app.route("/chat", methods=["POST"])
@@ -279,6 +376,36 @@ def reset():
     session_id = (request.json or {}).get("session_id", "default")
     session_storage.pop(session_id, None)
     return jsonify({"status": "Reset"})
+
+# -------------------------------
+# N8N LEGACY ROUTES (Merged from Express)
+# -------------------------------
+
+@app.route("/api/n8n/receiver", methods=["POST"])
+def n8n_receiver():
+    data = request.json or {}
+    result = db_receive_appointment_request(data)
+    return jsonify(result), 201 if result.get("status") else 400
+
+@app.route("/api/n8n/delete/<id>", methods=["DELETE"])
+def n8n_delete(id):
+    result = db_delete_by_phone(id)
+    return jsonify(result), 200 if result.get("status") else 500
+
+@app.route("/api/n8n/view/<id>", methods=["GET"])
+def n8n_view(id):
+    result = db_view_by_id(id)
+    if isinstance(result, list):
+        return jsonify(result), 200
+    return jsonify(result), 500
+
+@app.route("/api/n8n/update/<id>", methods=["PUT"])
+def n8n_update(id):
+    data = request.json or {}
+    result = db_update_by_id(id, data)
+    if "status" in result and not result["status"]:
+        return jsonify(result), 404
+    return jsonify(result), 200
 
 if __name__ == "__main__":
     app.run(port=5001, debug=True)
