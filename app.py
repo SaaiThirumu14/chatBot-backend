@@ -24,24 +24,11 @@ CORS(app)
 
 # -------------------------------
 # MONGODB CONFIG
-# -------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI)
 db = client['company-prj'] # Database name from MONGO_URI
 online_requests = db['onlinerequests'] # Mongoose pluralizes OnlineRequest
-
-# -------------------------------
-# CONFIG
-# -------------------------------
-# BASE_URL is no longer needed since we handle it locally
-# BASE_URL = os.getenv("CLINICAL_API_URL", "http://localhost:5000/api/n8n")
-
-# In-memory chat history (Global for demo, use DB for production)
 session_storage: Dict[str, List[Dict[str, Any]]] = {}
-
-# -------------------------------
-# SYSTEM PROMPTS
-# -------------------------------
 
 EXTRACTION_PROMPT = """
 You are a Clinical Extraction Agent for MediCare AI.
@@ -125,11 +112,24 @@ def get_history_text(session_id: str) -> str:
 def db_receive_appointment_request(data):
     name = data.get("name")
     phno = data.get("phno") or data.get("phone")
-    date = data.get("date")
+    date_str = data.get("date")
     time = data.get("time")
 
-    if not all([name, phno, date, time]):
+    if not all([name, phno, date_str, time]):
         return {"status": False, "message": "Please provide your name, phone, date, and time for appointment booking."}
+
+    # Convert date_str to datetime object for Mongoose compatibility
+    try:
+        # The extraction prompt asks for YYYY-MM-DD
+        booking_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        try:
+            # Fallback to other common formats or just use as is if parsing fails
+            # (though PyMongo needs a datetime object to store as BSON Date)
+            from dateutil import parser
+            booking_date = parser.parse(date_str)
+        except (ValueError, ImportError):
+            booking_date = date_str # Fallback to string if all else fails
 
     try:
         count = online_requests.count_documents({})
@@ -138,7 +138,7 @@ def db_receive_appointment_request(data):
         new_request = {
             "patientName": name,
             "patientContact": phno,
-            "date": date, # Storing as string or converting to Date if needed, but the JS one seemed to handle Date? Wait. The model says Date but the controller gets string.
+            "date": booking_date, 
             "time": time,
             "requestId": request_id,
             "status": "Pending",
